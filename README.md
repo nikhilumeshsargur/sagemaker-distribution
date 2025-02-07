@@ -1,7 +1,7 @@
 ## Amazon SageMaker Distribution
 
 Amazon SageMaker Distribution is a set of Docker images that include popular frameworks for machine learning, data
-science and visualization.
+science and visualization. For the list of supported SageMaker Distributions images, see [SageMaker Distributions Images](support_policy.md#supported-image-versions).
 
 These images come in two variants, CPU and GPU, and include deep learning frameworks like PyTorch, TensorFlow and
 Keras; popular Python packages like numpy, scikit-learn and pandas; and IDEs like Jupyter Lab. The distribution contains
@@ -55,6 +55,16 @@ VERSION=<Insert SageMaker Distribution version in semver format here. example: 0
 python ./src/main.py generate-staleness-report --target-patch-version $VERSION
 ```
 
+### Package Size Delta Report
+
+If you want to generate/view the package size delta report for a given
+SageMaker distribution image version comparing to a base image version, then run the following command:
+
+```
+BASE_PATCH_VERSION=<Insert SageMaker Distribution version of the base image in semver format here. example: 1.6.1>
+VERSION=<Insert SageMaker Distribution version of the target image in semver format here. example: 1.6.2>
+python ./src/main.py generate-size-report --base-patch-version $BASE_PATCH_VERSION --target-patch-version $VERSION
+```
 
 
 ## Example use cases
@@ -69,7 +79,6 @@ The easiest way to get it running on your laptop is through the Docker CLI:
 export ECR_IMAGE_ID='INSERT_IMAGE_YOU_WANT_TO_USE'
 docker run -it \
     -p 8888:8888 \
-    --user `id -u`:`id -g` \
     -v `pwd`/sample-notebooks:/home/sagemaker-user/sample-notebooks \
     $ECR_IMAGE_ID jupyter-lab --no-browser --ip=0.0.0.0
 ```
@@ -84,7 +93,6 @@ export ECR_IMAGE_ID='INSERT_IMAGE_YOU_WANT_TO_USE'
 docker run -it \
     -p 8888:8888 \
     --entrypoint entrypoint-jupyter-server \
-    --user `id -u`:`id -g` \
     -v `pwd`/sample-notebooks:/home/sagemaker-user/sample-notebooks \
     $ECR_IMAGE_ID
 ```

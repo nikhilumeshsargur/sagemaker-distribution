@@ -20,14 +20,20 @@ from dependency_upgrader import (
     _PATCH,
     _get_dependency_upper_bound_for_runtime_upgrade,
 )
-from package_staleness import generate_package_staleness_report
+from package_report import (
+    generate_package_dependency_report,
+    generate_package_size_report,
+    generate_package_staleness_report,
+)
 from release_notes_generator import generate_release_notes
 from utils import (
     get_dir_for_version,
     get_match_specs,
     get_semver,
     is_exists_dir_for_version,
+    post_handle_container_log,
 )
+from version_release_note_generator import generate_new_version_release_note
 
 _docker_client = docker.from_env()
 
@@ -41,15 +47,16 @@ def create_and_get_semver_dir(version: Version, exist_ok: bool = False):
         if not os.path.isdir(dir):
             raise Exception()
         # Delete all files except the additional_packages_env_in_file
-        _delete_all_files_except_additional_packages_input_files(dir)
+        _delete_all_files_except_additional_packages_input_files(dir, version)
     else:
         os.makedirs(dir)
     return dir
 
 
-def _delete_all_files_except_additional_packages_input_files(base_version_dir):
+def _delete_all_files_except_additional_packages_input_files(base_version_dir, version: Version):
     additional_package_env_in_files = [
-        image_generator_config["additional_packages_env_in_file"] for image_generator_config in _image_generator_configs
+        image_generator_config["additional_packages_env_in_file"]
+        for image_generator_config in _image_generator_configs[version.major]
     ]
     for filename in os.listdir(base_version_dir):
         if filename not in additional_package_env_in_files:
@@ -76,12 +83,12 @@ def _create_new_version_artifacts(args):
         raise Exception()
 
     base_patch_version = get_semver(args.base_patch_version)
-    if base_patch_version.prerelease:
-        # We don't support creating new patch/major/minor versions from a prerelease version
-        # Re-run the build command for the prerelease version again to pick the latest versions
-        # of the marquee packages
+    if base_patch_version.prerelease and args.pre_release_identifier:
+        # We support creating new patch/major/minor versions from a pre-release version.
+        # But We don't support passing the pre_release_identifier parameter while creating a new
+        # patch/major/minor versions from the pre-release version.
         raise Exception()
-    next_version = getattr(base_patch_version, runtime_version_upgrade_func)()
+    next_version = _get_next_version(base_patch_version, runtime_version_upgrade_func)
 
     if args.pre_release_identifier:
         next_version = next_version.replace(prerelease=args.pre_release_identifier)
@@ -89,7 +96,7 @@ def _create_new_version_artifacts(args):
     base_version_dir = get_dir_for_version(base_patch_version)
     new_version_dir = create_and_get_semver_dir(next_version, args.force)
 
-    for image_generator_config in _image_generator_configs:
+    for image_generator_config in _image_generator_configs[next_version.major]:
         _create_new_version_conda_specs(
             base_version_dir, new_version_dir, runtime_version_upgrade_type, image_generator_config
         )
@@ -111,8 +118,10 @@ def _copy_static_files(base_version_dir, new_version_dir, new_version_major, run
         base_path = base_version_dir
     else:
         base_path = f"template/v{new_version_major}"
+
     for f in glob.glob(os.path.relpath(f"{base_path}/Dockerfile")):
         shutil.copy2(f, new_version_dir)
+
     if int(new_version_major) >= 1:
         # dirs directory doesn't exist for v0. It was introduced only for v1
         dirs_relative_path = os.path.relpath(f"{base_path}/dirs")
@@ -205,10 +214,11 @@ def _push_images_upstream(image_versions_to_push: list[dict[str, str]], region: 
 
 
 def _test_local_images(image_ids_to_test: list[str], target_version: str):
-    assert len(image_ids_to_test) == len(_image_generator_configs)
+    major_version = get_semver(target_version).major
+    assert len(image_ids_to_test) == len(_image_generator_configs[major_version])
     exit_codes = []
     image_ids = []
-    for image_id, config in zip(image_ids_to_test, _image_generator_configs):
+    for image_id, config in zip(image_ids_to_test, _image_generator_configs[major_version]):
         exit_code = pytest.main(
             ["-n", "2", "-m", config["image_type"], "--local-image-version", target_version, *config["pytest_flags"]]
         )
@@ -241,8 +251,9 @@ def _build_local_images(
     generated_image_ids = []
     generated_image_versions = []
 
-    for image_generator_config in _image_generator_configs:
+    for image_generator_config in _image_generator_configs[target_version.major]:
         config = _get_config_for_image(target_version_dir, image_generator_config, force)
+        config["build_args"]["IMAGE_VERSION"] = config["image_tag_generator"].format(image_version=str(target_version))
         try:
             image, log_gen = _docker_client.images.build(
                 path=target_version_dir, rm=True, pull=True, buildargs=config["build_args"]
@@ -259,6 +270,7 @@ def _build_local_images(
             container_logs = _docker_client.containers.run(
                 image=image.id, detach=False, auto_remove=True, command="micromamba env export --explicit"
             )
+            container_logs = post_handle_container_log(container_logs)
         except ContainerError as e:
             print(e.container.logs().decode("utf-8"))
             # After printing the logs, raise the exception (which is the old behavior)
@@ -288,32 +300,41 @@ def _build_local_images(
     return generated_image_ids, generated_image_versions
 
 
+def _get_next_version(current_version: Version, upgrade_func: str) -> Version:
+    next_version = getattr(current_version, upgrade_func)()
+    if current_version.prerelease:
+        # Semver Ignores prerelease identifier when we do bump_{patch/minor/major}
+        next_version = next_version.replace(prerelease=current_version.prerelease)
+    return next_version
+
+
 # At some point of time, let's say some patch versions exist for both 2.6 and 2.7, and we create new patch
 # versions for both of them. Now, for the new 2.6.x, we can tag it as '2.6.x-cpu' and '2.6-cpu' but NOT '2-cpu' because
 # there is a more recent version (i.e. 2.7.x) that should be considered '2-cpu'. So, given a patch version, the
 # following function returns a list of versions for which the current patch version is latest for.
+# For versions with pre-release identifier, this method will return the appropriate tags
+# Example: For an version 2.0.0-beta, this method will return [2.0.0-beta, 2.0-beta, 2-beta,
+# latest-beta]
 def _get_version_tags(target_version: Version, env_out_file_name: str) -> list[str]:
     # First, add '2.6.x' as is.
     res = [str(target_version)]
-    # If this is a pre-release version, then don't add additional tags
-    if target_version.prerelease:
-        return res
+    prerelease_version_suffix = f"-{target_version.prerelease}" if target_version.prerelease else ""
 
     # If we were to add '2.6', check if '2.6.(x+1)' is present.
-    if not is_exists_dir_for_version(target_version.bump_patch(), env_out_file_name):
-        res.append(f"{target_version.major}.{target_version.minor}")
+    if not is_exists_dir_for_version(_get_next_version(target_version, "bump_patch"), env_out_file_name):
+        res.append(f"{target_version.major}.{target_version.minor}{prerelease_version_suffix}")
     else:
         return res
 
     # If we were to add '2', check if '2.7' is present.
-    if not is_exists_dir_for_version(target_version.bump_minor(), env_out_file_name):
-        res.append(str(target_version.major))
+    if not is_exists_dir_for_version(_get_next_version(target_version, "bump_minor"), env_out_file_name):
+        res.append(f"{target_version.major}{prerelease_version_suffix}")
     else:
         return res
 
     # If we were to add 'latest', check if '3.0.0' is present.
-    if not is_exists_dir_for_version(target_version.bump_major(), env_out_file_name):
-        res.append("latest")
+    if not is_exists_dir_for_version(_get_next_version(target_version, "bump_major"), env_out_file_name):
+        res.append(f"latest{prerelease_version_suffix}")
 
     return res
 
@@ -398,6 +419,57 @@ def get_arg_parser():
         "--target-patch-version",
         required=True,
         help="Specify the base patch version for which the package staleness report needs to be " "generated.",
+    )
+    package_size_parser = subparsers.add_parser(
+        "generate-size-report",
+        help="Generates toatl image size and package size report for each of the packages in the given "
+        "image version.",
+    )
+    package_size_parser.set_defaults(func=generate_package_size_report)
+    package_size_parser.add_argument(
+        "--target-patch-version",
+        required=True,
+        help="Specify the target patch version for which the package size report needs to be " "generated.",
+    )
+    package_size_parser.add_argument(
+        "--staging-repo-name",
+        required=True,
+        help="Specify the staging repository",
+    )
+    package_size_parser.add_argument(
+        "--staging-account",
+        required=True,
+        help="Specify the staging account",
+    )
+    package_size_parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Validate package size delta and raise error if the validation failed.",
+    )
+    package_dependency_parser = subparsers.add_parser(
+        "generate-dependency-report",
+        help="Generates package dependency report for each of newly introcuded packages in the target image version.",
+    )
+    package_dependency_parser.set_defaults(func=generate_package_dependency_report)
+    package_dependency_parser.add_argument(
+        "--target-patch-version",
+        required=True,
+        help="Specify the target patch version for which the package dependency report needs to be generated.",
+    )
+    package_release_parser = subparsers.add_parser(
+        "generate-version-release-note",
+        help="Generates release for each new image version.",
+    )
+    package_release_parser.set_defaults(func=generate_new_version_release_note)
+    package_release_parser.add_argument(
+        "--target-patch-version",
+        required=True,
+        help="Specify the target patch version for which the release needs to be generated.",
+    )
+    package_release_parser.add_argument(
+        "--image-type",
+        required=True,
+        help="Specify the image type for which the release needs to be generated.",
     )
     return parser
 
